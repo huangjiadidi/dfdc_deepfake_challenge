@@ -68,6 +68,106 @@ def create_val_transforms(size=300):
     ])
 
 
+"""
+correlation kn for deepfake detection:
+
+using pytorch hook method to extract the forward feature map
+"""
+
+
+# define a global list for hook function
+extracted_feature_maps = []
+
+# define hook function to extract, assuming that in the end of each eopch, the system will renew (empty) the list
+def hook_function(model, input, output):
+    extracted_feature_maps.append(output)
+
+
+# extracting the sub feature map blocks based on the given landmark
+# note: according to the guide in mctnn, the lankmark is a numpy array including 9 vector.
+# which recorresponding to 9 locations: top-left, top-right, button-left, button-right, left-eye, right-eye
+# nose, mouth-left, mouth-right
+
+def extract_each_block_landmark(block, landmarks, orginal_image_size):
+    count = 0
+
+    map_size_width, map_size_height = block.shape[2:3]
+
+    map_size_width -= 1
+    map_size_height -= 1
+    
+    width_scale = map_size_width/orginal_image_size
+    height_scale = map_size_height/orginal_image_size
+
+    # a list to store the cropped feature maps based on the landmarks
+    cropped_maps = []
+    for landmark in landmarks:
+        cropped_parts = []
+        
+        for facial_part in landmark:
+            scaled_part = round(facial_part[0]*width_scale)
+            scaled_part = round(scaled_part[1]*height_scale)
+
+            if (scaled_part[0] == 0):
+                scaled_part[0] = 1
+            elif (scaled_part[0] == map_size_width):
+                scaled_part[0] = map_size_width-1
+            
+            if (scaled_part[1] == 0):
+                scaled_part[1] = 1
+            elif (scaled_part[1] == map_size_height):
+                scaled_part[1] = map_size_height-1
+            
+            each_cropped_part = block[:, :, part[0]-1:part[0]+2, part[1]-1:part[1]+2]
+
+            cropped_parts.apped(each_cropped_part.view(-1))
+
+        cropped_parts = torch.stack(cropped_parts)
+        cropped_maps.append(cropped_parts)
+        count += 1
+    output = torch.stack(cropped_maps)
+    return output
+
+def cos_sim_matrix(a, b, eps=1e-8):
+    """
+    work for batch of tensor!
+    added eps for numerical stability
+    reference: https://stackoverflow.com/questions/50411191/how-to-compute-the-cosine-similarity-in-pytorch-for-all-rows-in-a-matrix-with-re
+    """
+    a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]
+    a_norm = a / torch.max(a_n, eps * torch.ones_like(a_n))
+    b_norm = b / torch.max(b_n, eps * torch.ones_like(b_n))
+    sim_mt = torch.mm(a_norm, b_norm.transpose(0, 1))
+    return sim_mt
+
+# define two correlation loss -- the intra loss and the inter loss
+
+def frames_intra_loss(student_feature_map_transfered, teacher_feature_map_transfered):
+    # print(student_feature_map_transfered.size())
+    student_feature_map_reshaped = student_feature_map_transfered.reshape(student_feature_map_transfered.size()[0], -1)
+    teacher_feature_map_reshaped = teacher_feature_map_transfered.reshape(teacher_feature_map_transfered.size()[0], -1)
+
+    # print(teacher_feature_map_reshaped.size())
+    sim_matrix = cos_sim_matrix(student_feature_map_reshaped, teacher_feature_map_reshaped)
+
+    cos_sim_norm = torch.norm(sim_matrix)
+    return cos_sim_norm
+
+def frames_inter_loss(student_feature_map_transfered, teacher_feature_map_transfered):
+
+    student_feature_map_transfered_switched = student_feature_map_transfered.transpose(0,1)
+    teacher_feature_map_transfered_switched = teacher_feature_map_transfered.transpose(0,1)
+
+    student_feature_map_reshaped = student_feature_map_transfered_switched.reshape(student_feature_map_transfered_switched.size()[0], -1)
+    teacher_feature_map_reshaped = teacher_feature_map_transfered_switched.reshape(teacher_feature_map_transfered_switched.size()[0], -1)
+    # print(student_feature_map_reshaped.size())
+
+    sim_matrix = cos_sim_matrix(student_feature_map_reshaped, teacher_feature_map_reshaped)
+
+    cos_sim_norm = torch.norm(sim_matrix)
+    return cos_sim_norm   
+
+
 def main():
     parser = argparse.ArgumentParser("PyTorch Xview Pipeline")
     arg = parser.add_argument
@@ -182,8 +282,16 @@ def main():
         model = DistributedDataParallel(model, delay_allreduce=True)
     else:
         model = DataParallel(model).cuda()
+
+    # register each block, in order to extract the blocks' feature maps
+    for name, block in model.encoder.blocks.named_children():
+        block.register_forward_hook(hook_function)
+
+
     data_val.reset(1, args.seed)
     max_epochs = conf['optimizer']['schedule']['epochs']
+
+
     for epoch in range(start_epoch, max_epochs):
         data_train.reset(epoch, args.seed)
         train_sampler = None
