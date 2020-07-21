@@ -74,4 +74,6 @@ def landmark_random_walk(landmarks, path):
 
         modified_landmarks.append(temp_list)
 
+    
+
     return modified_landmarks
